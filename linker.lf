@@ -1,0 +1,5 @@
+[mapping:doom_extram]
+archive: libdoomgeneric.a
+entries:
+    * (extram_bss)
+    * (extram_data)
