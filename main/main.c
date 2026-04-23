@@ -20,9 +20,22 @@
 #define SDA_GPIO 7
 #define SCL_GPIO 15
 #define OLED_ADDRESS 0x3C
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define SCL_SPEED_HZ 1000000
+#define I2C_BUS_SPEED 1000000
+
+#define DOOM_RES_W 640
+#define DOOM_RES_H 400
+#define OLED_RES_W 128
+#define OLED_RES_H 64
+#define OLED_BUF_SIZE 1024
+
+// how many pixels we skip (don't change this)
+#define STRIDE_X (DOOM_RES_W / OLED_RES_W) 
+#define STRIDE_Y (DOOM_RES_H / OLED_RES_H)
+
+#define EDGE_THRESHOLD 35   // higher = cleaner world, lower = more outlines
+#define LUM_THRESHOLD  40   // higher -> darker
+#define CONTRAST_MUL   20
+#define CONTRAST_DIV   10
 
 int drone = 0;
 int net_client_connected = 0;
@@ -36,14 +49,16 @@ void init_i2c() {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
     };
+
     i2c_master_bus_handle_t bus_handle; 
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus_handle));
 
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = OLED_ADDRESS,
-        .scl_speed_hz = SCL_SPEED_HZ,
+        .scl_speed_hz = I2C_BUS_SPEED,
     };
+
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_config, &oled_dev_handle));
 }
 
@@ -61,24 +76,14 @@ void oled_data(uint8_t *buffer, size_t len) {
 
 void ssd1306_init() {
     vTaskDelay(pdMS_TO_TICKS(100));
-    oled_cmd(0xAE); 
-    oled_cmd(0xD5); oled_cmd(0x80); 
-    oled_cmd(0xA8); oled_cmd(0x3F); 
-    oled_cmd(0xD3); oled_cmd(0x00); 
-    oled_cmd(0x40); 
-    oled_cmd(0x20); oled_cmd(0x00); 
-    oled_cmd(0x21); oled_cmd(0); oled_cmd(127);
-    oled_cmd(0x22); oled_cmd(0); oled_cmd(7);
-    oled_cmd(0xA1); 
-    oled_cmd(0xC8); 
-    oled_cmd(0xDA); oled_cmd(0x12); 
-    oled_cmd(0x81); oled_cmd(0xFF); 
-    oled_cmd(0xD9); oled_cmd(0xF1); 
-    oled_cmd(0xDB); oled_cmd(0x40); 
-    oled_cmd(0xA4); 
-    oled_cmd(0xA6); 
-    oled_cmd(0x8D); oled_cmd(0x14); 
-    oled_cmd(0xAF); 
+    const uint8_t init_seq[] = {
+        0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40, 
+        0x20, 0x00, 0x21, 0, 127, 0x22, 0, 7,
+        0xA1, 0xC8, 0xDA, 0x12, 0x81, 0xFF, 0xD9, 0xF1, 
+        0xDB, 0x40, 0xA4, 0xA6, 0x8D, 0x14, 0xAF
+    };
+
+    for(int i = 0; i < sizeof(init_seq); i++) oled_cmd(init_seq[i]);
 }
 
 void mount_wad() {
@@ -96,59 +101,76 @@ void oled_reset_pointers() {
 
 void DG_Init() {}
 
-// FIX: added 'static' to keep the linker happy
-static inline uint8_t get_lum_fast(uint32_t* buf, int x, int y) {
+static inline uint8_t get_lum_fast(uint32_t *buf, int x, int y) {
     if (x < 0 || x >= 320 || y < 0 || y >= 200) return 0;
     uint32_t c = buf[y * 320 + x];
+
     // fast luminance approx: (2R + 5G + B) / 8
     return (uint8_t)((((c >> 16) & 0xFF) * 2 + ((c >> 8) & 0xFF) * 5 + (c & 0xFF)) >> 3);
 }
 
 void DG_DrawFrame() {
     oled_reset_pointers();
-    uint8_t oled_buf[1024] = {0};
-    uint32_t* pixel_data = (uint32_t*) DG_ScreenBuffer;
+    uint8_t oled_buf[OLED_BUF_SIZE] = {0};
+    uint32_t *pixel_data = (uint32_t*) DG_ScreenBuffer;
 
     static const uint8_t bayer_4x4[4][4] = {
-        { 15, 135,  45, 165 }, { 195,  75, 225, 105 },
-        { 60, 180,  30, 150 }, { 240, 120, 210,  90 }
+        { 15, 135, 45, 165 }, { 195, 75, 225, 105 },
+        { 60, 180, 30, 150 }, { 240, 120, 210, 90 }
     };
 
-    // based on ur log, the engine is rendering 640x400
-    // so every 1 pixel on oled = a 5x6.25 block in the buffer
-    for (int y = 0; y < 64; y++) {
-        int dy = y * 6; // 400 / 64 approx 6.25
-        uint32_t* row_ptr = &pixel_data[dy * 640];
+    for (int y = 0; y < OLED_RES_H; y++) {
+        uint32_t *row = &pixel_data[(y * STRIDE_Y) * DOOM_RES_W];
+        uint32_t *next_row = &pixel_data[((y + 1) * STRIDE_Y) * DOOM_RES_W];
 
-        for (int x = 0; x < 128; x++) {
-            int dx = x * 5; // 640 / 128 = 5
+        for (int x = 0; x < OLED_RES_W; x++) {
+            // 1. BOX SAMPLE (2x2 average) - kills the shimmering texture noise
+            uint32_t c00 = row[x * STRIDE_X];
+            uint32_t c01 = row[x * STRIDE_X + 1];
+            uint32_t c10 = next_row[x * STRIDE_X];
+            uint32_t c11 = next_row[x * STRIDE_X + 1];
 
-            uint32_t color = row_ptr[dx];
-            
-            // fast lum
-            uint16_t lum = (((color >> 16) & 0xFF) * 2 + ((color >> 8) & 0xFF) * 5 + (color & 0xFF)) >> 3;
+            uint16_t r = (((c00>>16)&0xFF) + ((c01>>16)&0xFF) + ((c10>>16)&0xFF) + ((c11>>16)&0xFF)) >> 2;
+            uint16_t g = (((c00>>8)&0xFF) + ((c01>>8)&0xFF) + ((c10>>8)&0xFF) + ((c11>>8)&0xFF)) >> 2;
+            uint16_t b = ((c00&0xFF) + (c01&0xFF) + (c10&0xFF) + (c11&0xFF)) >> 2;
 
-            // contrast pop: crush blacks, stretch whites
-            if (lum < 60) {
-                lum = 0;
-            } else {
-                lum = ((lum - 60) * 255) / 195;
-                lum = (lum * 15) / 10; // 1.5x boost
-                if (lum > 255) lum = 255;
+            uint16_t lum = (r * 2 + g * 5 + b) >> 3;
+
+            uint16_t lum_r = (((c01>>16)&0xFF)*2 + ((c01>>8)&0xFF)*5 + (c01&0xFF)) >> 3;
+            uint16_t lum_d = (((c10>>16)&0xFF)*2 + ((c10>>8)&0xFF)*5 + (c10&0xFF)) >> 3;
+            uint16_t edge = abs(lum - lum_r) + abs(lum - lum_d);
+
+            uint16_t final_lum = 0;
+            if (lum > LUM_THRESHOLD) {
+                final_lum = ((lum - LUM_THRESHOLD) * 255) / (255 - LUM_THRESHOLD);
+                final_lum = (final_lum * CONTRAST_MUL) / CONTRAST_DIV;
+                if (final_lum > 255) final_lum = 255;
             }
 
-            if (lum > bayer_4x4[y & 3][x & 3]) {
-                oled_buf[x + (y >> 3) * 128] |= (1 << (y & 7));
+            if (edge > EDGE_THRESHOLD || final_lum > bayer_4x4[y & 3][x & 3]) {
+                oled_buf[x + (y >> 3) * OLED_RES_W] |= (1 << (y & 7));
             }
         }
     }
-    oled_data(oled_buf, 1024);
+    oled_data(oled_buf, OLED_BUF_SIZE);
 }
 
-uint32_t DG_GetTicksMs() { return (uint32_t)(esp_timer_get_time() / 1000); }
-void DG_SleepMs(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
-int DG_GetKey(int* pressed, unsigned char* key) { return 0; }
-void DG_SetWindowTitle(const char * title) { printf("doom window: %s\n", title); }
+uint32_t DG_GetTicksMs() {
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+void DG_SleepMs(uint32_t ms) {
+    vTaskDelay(pdMS_TO_TICKS(ms));
+}
+
+int DG_GetKey(int *pressed, unsigned char *key) {
+    return 0;
+}
+
+void DG_SetWindowTitle(const char *title) {
+    printf("doom window: %s\n", title);
+}
+
 //tree = true! - russ 2026
 void app_main(void) {
     mount_wad();
@@ -156,7 +178,7 @@ void app_main(void) {
     ssd1306_init();
     printf("hardware is set up. booting engine...\n");
 
-    char* args[] = { "doom", "-iwad", "/spiffs/doom1.wad" };
+    char *args[] = { "doom", "-iwad", "/spiffs/doom1.wad" };
     doomgeneric_Create(3, args);
 
     while (1) { 
